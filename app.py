@@ -14,9 +14,13 @@ All external telecom/SMS actions are disabled. All analysis remains strictly loc
 
 import sys
 import json
+import os
+import urllib.error
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Optional, Dict, List
+from urllib.parse import urlsplit
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -54,6 +58,62 @@ from audio_transcription import (
     get_sample_call_presets,
     MAX_AUDIO_SIZE_BYTES,
 )
+from live_audio import LiveAudioBuffer, pcm16_mono_to_wav
+
+try:
+    from streamlit_webrtc import WebRtcMode, webrtc_streamer
+    STREAMLIT_WEBRTC_AVAILABLE = True
+except ImportError:
+    WebRtcMode = None
+    webrtc_streamer = None
+    STREAMLIT_WEBRTC_AVAILABLE = False
+
+
+def _set_recorded_call_transcript(text: str) -> None:
+    st.session_state.recorded_call_transcript = text
+    st.session_state.recorded_call_transcript_input = text
+
+
+def _sync_recorded_call_transcript() -> None:
+    st.session_state.recorded_call_transcript = st.session_state.recorded_call_transcript_input
+
+
+def _fetch_latest_telephony_alert():
+    base_url = os.getenv("SCAMSHIELD_ALERT_API_URL", "").rstrip("/")
+    alert_token = os.getenv("SCAMSHIELD_ALERT_TOKEN", "")
+    if not base_url or not alert_token:
+        return None, None
+    parsed_url = urlsplit(base_url)
+    if (
+        (parsed_url.scheme != "https" and parsed_url.hostname not in {"localhost", "127.0.0.1", "::1"})
+        or parsed_url.username
+        or parsed_url.password
+        or parsed_url.path
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        return None, "Telephony alert API must use HTTPS except for localhost development."
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        return None, "SCAMSHIELD_ALERT_API_URL must be a valid HTTP(S) origin."
+
+    request = urllib.request.Request(
+        f"{base_url}/alerts/latest",
+        headers={"Authorization": f"Bearer {alert_token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=4) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return None, f"Telephony alert service returned HTTP {exc.code}."
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return None, f"Could not reach the telephony alert service: {exc}"
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"Telephony alert service returned invalid JSON: {exc}"
+
+    call = payload.get("call")
+    if call is not None and not isinstance(call, dict):
+        return None, "Telephony alert service returned an invalid call payload."
+    return call, None
 
 
 def run_dashboard():
@@ -202,6 +262,9 @@ def run_dashboard():
     if "recorded_call_transcript" not in st.session_state:
         st.session_state.recorded_call_transcript = ""
 
+    if "recorded_call_transcript_input" not in st.session_state:
+        st.session_state.recorded_call_transcript_input = st.session_state.recorded_call_transcript
+
     if "recorded_call_metadata" not in st.session_state:
         st.session_state.recorded_call_metadata = None
 
@@ -216,6 +279,24 @@ def run_dashboard():
 
     if "recorded_call_stt_result" not in st.session_state:
         st.session_state.recorded_call_stt_result = None
+
+    if "live_monitor_enabled" not in st.session_state:
+        st.session_state.live_monitor_enabled = False
+
+    if "live_audio_buffer" not in st.session_state:
+        st.session_state.live_audio_buffer = None
+
+    if "live_call_transcript" not in st.session_state:
+        st.session_state.live_call_transcript = ""
+
+    if "live_call_risk" not in st.session_state:
+        st.session_state.live_call_risk = None
+
+    if "live_call_error" not in st.session_state:
+        st.session_state.live_call_error = None
+
+    if "live_monitor_was_playing" not in st.session_state:
+        st.session_state.live_monitor_was_playing = False
 
 
 
@@ -285,7 +366,7 @@ def run_dashboard():
         "🛡️ Guardian Agent (Detection)",
         "🤖 Decoy Agent (Simulation)",
         "📊 Intelligence Agent (Report)",
-        "🎙️ Recorded Call Analysis",
+        "🎙️ Live & Recorded Call Analysis",
         "🔒 Safety & Compliance Guardrails",
     ])
 
@@ -715,7 +796,225 @@ def run_dashboard():
     # ===========================================================================
 
     with tab_audio:
-        st.markdown("### 🎙️ Recorded Call Analysis: Voice Extortion & Scam Detection")
+        st.markdown("### 🎙️ Live & Recorded Call Analysis: Voice Extortion & Scam Detection")
+        st.markdown("#### 📞 Telephony Provider Alerts (Alert-Only)")
+        st.caption(
+            "For real phone calls, the separate Twilio service forwards the call to you and sends "
+            "redacted live transcript/risk updates here. It never speaks to the caller."
+        )
+        if not (
+            os.getenv("SCAMSHIELD_ALERT_API_URL")
+            and os.getenv("SCAMSHIELD_ALERT_TOKEN")
+        ):
+            st.info(
+                "The telephony service is not connected yet. Configure "
+                "`SCAMSHIELD_ALERT_API_URL` and `SCAMSHIELD_ALERT_TOKEN` after deploying "
+                "`twilio_live_server.py`."
+            )
+        else:
+            @st.fragment(run_every="3s")
+            def render_telephony_alert():
+                call_alert, alert_error = _fetch_latest_telephony_alert()
+                if alert_error:
+                    st.error(alert_error)
+                elif not call_alert:
+                    st.info("Waiting for a monitored incoming call.")
+                else:
+                    status = "Call is active" if call_alert.get("active") else "Last call ended"
+                    st.caption(f"{status} · Call reference: `{call_alert.get('call_sid', 'N/A')}`")
+                    if call_alert.get("error"):
+                        st.warning(call_alert["error"])
+                    transcript = call_alert.get("transcript", "")
+                    if transcript:
+                        st.text_area(
+                            "Redacted live call transcript",
+                            value=transcript,
+                            height=130,
+                            disabled=True,
+                            key=f"telephony_transcript_{call_alert.get('call_sid', 'latest')}",
+                        )
+                    level = call_alert.get("risk_level", "LOW")
+                    score = call_alert.get("risk_score", 0)
+                    if level == "HIGH":
+                        st.error(
+                            f"HIGH scam risk — {score}/100. Do not transfer money or share "
+                            "OTPs, passwords, or PINs."
+                        )
+                    elif level == "MEDIUM":
+                        st.warning(
+                            f"Potential scam indicators detected — {score}/100. "
+                            "Verify the caller independently."
+                        )
+                    else:
+                        st.info(f"Current risk assessment: {level} — {score}/100.")
+                    for indicator in call_alert.get("suspicious_indicators", []):
+                        st.markdown(f"- {indicator}")
+
+            render_telephony_alert()
+
+        st.markdown("---")
+        st.markdown("#### 🔴 Live Call Monitor")
+        st.markdown(
+            "Monitor a call in real time through your computer's microphone. Put the call on speakerphone "
+            "so the other caller is audible to the microphone. This browser app cannot access a phone's "
+            "private cellular-call audio directly."
+        )
+        st.caption(
+            "Audio is processed locally in short chunks and is not saved as a recording. The microphone "
+            "runs only while live monitoring is active; use this only where you have permission to monitor the call."
+        )
+
+        transcriber_engine = AudioTranscriber()
+        is_stt_ready = (
+            transcriber_engine.backend.is_available()
+            and transcriber_engine.backend.name != "FallbackManualBackend"
+        )
+
+        if not STREAMLIT_WEBRTC_AVAILABLE:
+            st.error(
+                "Live microphone capture is unavailable. Install the project dependencies with "
+                "`python -m pip install -r requirements.txt`, then restart the app."
+            )
+        elif not is_stt_ready:
+            st.error(
+                "Live transcription needs the local faster-whisper engine. Install the project dependencies "
+                "with `python -m pip install -r requirements.txt`, then restart the app."
+            )
+        elif not st.session_state.live_monitor_enabled:
+            if st.button("Enable Live Call Monitor", type="primary", key="enable_live_call_monitor"):
+                st.session_state.live_audio_buffer = LiveAudioBuffer()
+                st.session_state.live_call_transcript = ""
+                st.session_state.live_call_risk = None
+                st.session_state.live_call_error = None
+                st.session_state.live_monitor_was_playing = False
+                st.session_state.live_monitor_enabled = True
+                st.rerun()
+        else:
+            live_language_label = st.selectbox(
+                "Live call language:",
+                options=[
+                    "Hindi (हिन्दी / Hinglish)",
+                    "Auto-detect",
+                    "English",
+                ],
+                key="live_call_language",
+            )
+            live_language_code = {
+                "Hindi (हिन्दी / Hinglish)": "hi",
+                "Auto-detect": "auto",
+                "English": "en",
+            }[live_language_label]
+            live_buffer = st.session_state.live_audio_buffer
+
+            if live_buffer is None:
+                st.error("Live audio buffer was not initialized. Disable and re-enable the live monitor.")
+            else:
+                @st.fragment(run_every="2s")
+                def render_live_call_monitor():
+                    live_ctx = webrtc_streamer(
+                        key="live-call-microphone",
+                        mode=WebRtcMode.SENDONLY,
+                        rtc_configuration={"iceServers": []},
+                        audio_frame_callback=live_buffer.audio_frame_callback,
+                        media_stream_constraints={"video": False, "audio": True},
+                        async_processing=True,
+                    )
+
+                    if live_ctx.state.playing:
+                        st.success("Microphone is active. Listening locally for speech...")
+                        st.session_state.live_monitor_was_playing = True
+                    elif st.session_state.live_monitor_was_playing:
+                        st.info("Microphone stopped. Processing any remaining audio...")
+
+                    if live_buffer.error:
+                        st.error(live_buffer.error)
+
+                    final_chunk = (
+                        not live_ctx.state.playing
+                        and st.session_state.live_monitor_was_playing
+                    )
+                    pcm_chunk = live_buffer.take_chunk()
+                    if pcm_chunk is None and final_chunk:
+                        pcm_chunk = live_buffer.take_chunk(final=True)
+
+                    if pcm_chunk:
+                        try:
+                            chunk_wav = pcm16_mono_to_wav(pcm_chunk, live_buffer.sample_rate)
+                            result = transcriber_engine.transcribe(
+                                chunk_wav,
+                                "live_call_chunk.wav",
+                                language=live_language_code,
+                            )
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            st.session_state.live_call_error = f"Live transcription failed: {exc}"
+                            result = None
+
+                        if result is not None:
+                            if result.get("success") and result.get("transcript", "").strip():
+                                new_text = result["transcript"].strip()
+                                previous_text = st.session_state.live_call_transcript.strip()
+                                st.session_state.live_call_transcript = (
+                                    f"{previous_text} {new_text}".strip()
+                                )
+                                validated = validate_input_text(
+                                    st.session_state.live_call_transcript[-5000:]
+                                )
+                                if validated["is_valid"]:
+                                    credentials = detect_sensitive_credentials(validated["sanitized_text"])
+                                    st.session_state.live_call_risk = analyze_message(
+                                        credentials["redacted_text"]
+                                    )
+                                else:
+                                    st.session_state.live_call_error = validated["error"]
+                            elif not result.get("success"):
+                                st.session_state.live_call_error = result.get(
+                                    "error", result.get("notice", "Live transcription failed.")
+                                )
+
+                    if st.session_state.live_call_error:
+                        st.error(st.session_state.live_call_error)
+
+                    transcript = st.session_state.live_call_transcript
+                    if transcript:
+                        st.markdown("##### Live transcript (review before relying on it)")
+                        st.text(transcript)
+                        risk = st.session_state.live_call_risk
+                        if risk:
+                            level = risk.get("risk_level", "LOW")
+                            score = risk.get("risk_score", 0)
+                            if level == "HIGH":
+                                st.error(
+                                    f"HIGH scam risk — {score}/100. Consider ending the call. "
+                                    "Do not transfer money or share OTPs, passwords, or PINs."
+                                )
+                            elif level == "MEDIUM":
+                                st.warning(
+                                    f"Potential scam indicators detected — {score}/100. "
+                                    "Verify the caller independently; do not share sensitive information."
+                                )
+                            else:
+                                st.info(f"Current risk assessment: {level} — {score}/100.")
+
+                        if st.button("Use live transcript in call analysis", key="use_live_transcript"):
+                            _set_recorded_call_transcript(transcript)
+                            st.rerun()
+                    else:
+                        st.caption(
+                            "Transcription updates in approximately six-second chunks. "
+                            f"Audio buffered: {live_buffer.buffered_seconds:.1f}s."
+                        )
+
+                    if final_chunk and live_buffer.buffered_seconds < 1.5:
+                        if live_buffer.buffered_seconds:
+                            st.caption(
+                                "The final audio tail was shorter than 1.5 seconds and was not transcribed."
+                            )
+                            live_buffer.discard_pending_audio()
+                        st.session_state.live_monitor_was_playing = False
+
+                render_live_call_monitor()
+
+        st.markdown("---")
         st.markdown(
             "Upload or inspect suspicious voice recordings (.wav or .mp3, max 25 MB) to perform offline acoustic "
             "metadata inspection, speech-to-text transcript verification, Guardian threat scoring, and structured intelligence reporting."
@@ -732,7 +1031,7 @@ def run_dashboard():
                 p = demo_presets[0]
                 st.session_state.recorded_call_bytes = p["audio_bytes"]
                 st.session_state.recorded_call_filename = p["filename"]
-                st.session_state.recorded_call_transcript = p["transcript"]
+                _set_recorded_call_transcript(p["transcript"])
                 st.session_state.recorded_call_metadata = extract_audio_metadata(p["audio_bytes"], p["filename"])
                 st.session_state.recorded_call_analysis = None
                 st.session_state.recorded_call_intel_report = None
@@ -744,7 +1043,7 @@ def run_dashboard():
                 p = demo_presets[1]
                 st.session_state.recorded_call_bytes = p["audio_bytes"]
                 st.session_state.recorded_call_filename = p["filename"]
-                st.session_state.recorded_call_transcript = p["transcript"]
+                _set_recorded_call_transcript(p["transcript"])
                 st.session_state.recorded_call_metadata = extract_audio_metadata(p["audio_bytes"], p["filename"])
                 st.session_state.recorded_call_analysis = None
                 st.session_state.recorded_call_intel_report = None
@@ -756,7 +1055,7 @@ def run_dashboard():
                 p = demo_presets[2]
                 st.session_state.recorded_call_bytes = p["audio_bytes"]
                 st.session_state.recorded_call_filename = p["filename"]
-                st.session_state.recorded_call_transcript = p["transcript"]
+                _set_recorded_call_transcript(p["transcript"])
                 st.session_state.recorded_call_metadata = extract_audio_metadata(p["audio_bytes"], p["filename"])
                 st.session_state.recorded_call_analysis = None
                 st.session_state.recorded_call_intel_report = None
@@ -768,7 +1067,7 @@ def run_dashboard():
                 p = demo_presets[3]
                 st.session_state.recorded_call_bytes = p["audio_bytes"]
                 st.session_state.recorded_call_filename = p["filename"]
-                st.session_state.recorded_call_transcript = p["transcript"]
+                _set_recorded_call_transcript(p["transcript"])
                 st.session_state.recorded_call_metadata = extract_audio_metadata(p["audio_bytes"], p["filename"])
                 st.session_state.recorded_call_analysis = None
                 st.session_state.recorded_call_intel_report = None
@@ -780,7 +1079,7 @@ def run_dashboard():
                 p = demo_presets[4]
                 st.session_state.recorded_call_bytes = p["audio_bytes"]
                 st.session_state.recorded_call_filename = p["filename"]
-                st.session_state.recorded_call_transcript = p["transcript"]
+                _set_recorded_call_transcript(p["transcript"])
                 st.session_state.recorded_call_metadata = extract_audio_metadata(p["audio_bytes"], p["filename"])
                 st.session_state.recorded_call_analysis = None
                 st.session_state.recorded_call_intel_report = None
@@ -792,7 +1091,7 @@ def run_dashboard():
                 p = demo_presets[5]
                 st.session_state.recorded_call_bytes = p["audio_bytes"]
                 st.session_state.recorded_call_filename = p["filename"]
-                st.session_state.recorded_call_transcript = p["transcript"]
+                _set_recorded_call_transcript(p["transcript"])
                 st.session_state.recorded_call_metadata = extract_audio_metadata(p["audio_bytes"], p["filename"])
                 st.session_state.recorded_call_analysis = None
                 st.session_state.recorded_call_intel_report = None
@@ -821,7 +1120,7 @@ def run_dashboard():
                     st.session_state.recorded_call_bytes = uploaded_bytes
                     st.session_state.recorded_call_filename = uploaded_audio_file.name
                     st.session_state.recorded_call_metadata = extract_audio_metadata(uploaded_bytes, uploaded_audio_file.name)
-                    st.session_state.recorded_call_transcript = ""
+                    _set_recorded_call_transcript("")
                     st.session_state.recorded_call_analysis = None
                     st.session_state.recorded_call_intel_report = None
                     st.session_state.recorded_call_stt_result = None
@@ -860,9 +1159,6 @@ def run_dashboard():
         st.markdown("#### 🗣️ Step 2: Speech-to-Text Transcription & Human Review")
 
         # Transcriber engine status check
-        transcriber_engine = AudioTranscriber()
-        is_stt_ready = transcriber_engine.backend.is_available()
-
         if not is_stt_ready or transcriber_engine.backend.name == "FallbackManualBackend":
             st.warning(
                 "ℹ️ **Offline Engine Notice**: Local speech-to-text neural engine weights (e.g., Whisper/PyTorch) "
@@ -928,13 +1224,13 @@ def run_dashboard():
                     )
                     st.session_state.recorded_call_stt_result = res
                     if res["success"] and res.get("transcript"):
-                        st.session_state.recorded_call_transcript = res["transcript"]
+                        _set_recorded_call_transcript(res["transcript"])
                         st.success(f"✅ {res.get('notice', 'Speech-to-text transcription completed successfully!')}")
                     elif res["success"] and not res.get("transcript"):
                         st.info(f"ℹ️ {res.get('notice', 'No discernible speech was detected in this recording.')}")
                     else:
                         if not st.session_state.recorded_call_transcript:
-                            st.session_state.recorded_call_transcript = res.get("transcript", "")
+                            _set_recorded_call_transcript(res.get("transcript", ""))
                         st.info(res.get("notice", "Manual transcript required."))
 
         # STT Quality Warnings & Segments
@@ -1030,7 +1326,8 @@ def run_dashboard():
         # Human-in-the-loop review text area
         transcript_input = st.text_area(
             "Call Transcript (Review, edit, or type transcript before risk analysis):",
-            value=st.session_state.recorded_call_transcript,
+            key="recorded_call_transcript_input",
+            on_change=_sync_recorded_call_transcript,
             height=140,
             placeholder="Transcript will appear here once audio is transcribed or loaded. You can also paste or type the transcript directly.",
         )

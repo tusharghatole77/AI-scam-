@@ -42,6 +42,7 @@ from audio_transcription import (
 from guardian_agent import analyze_message
 from intelligence_agent import extract_intelligence, format_text_report
 from safety import validate_input_text, detect_sensitive_credentials, validate_intelligence_report
+from live_audio import LiveAudioBuffer, pcm16_mono_to_wav
 
 
 class TestAudioAnalysis(unittest.TestCase):
@@ -63,6 +64,54 @@ class TestAudioAnalysis(unittest.TestCase):
         self.assertEqual(res["audio_format"], "WAV")
         self.assertIsNone(res["error"])
         self.assertGreater(res["file_size_bytes"], 1000)
+
+    def test_live_audio_buffer_yields_fixed_chunks(self):
+        buffer = LiveAudioBuffer(
+            chunk_seconds=1,
+            max_buffer_seconds=3,
+            sample_rate=2,
+            resampler=object(),
+        )
+        buffer.append_pcm_bytes(b"\x01\x00")
+        self.assertAlmostEqual(buffer.buffered_seconds, 0.5)
+        self.assertIsNone(buffer.take_chunk())
+
+        buffer.append_pcm_bytes(b"\x02\x00")
+        chunk = buffer.take_chunk()
+        self.assertEqual(chunk, b"\x01\x00" + b"\x02\x00")
+        self.assertEqual(buffer.buffered_seconds, 0)
+        buffer.append_pcm_bytes(b"\x03\x00")
+        buffer.discard_pending_audio()
+        self.assertEqual(buffer.buffered_seconds, 0)
+
+    def test_live_audio_buffer_flushes_final_speech_chunk(self):
+        buffer = LiveAudioBuffer(
+            chunk_seconds=2,
+            max_buffer_seconds=3,
+            sample_rate=2,
+            resampler=object(),
+        )
+        final_audio = b"\x01\x00" * 3
+        buffer.append_pcm_bytes(final_audio)
+        self.assertIsNone(buffer.take_chunk())
+        self.assertEqual(buffer.take_chunk(final=True), final_audio)
+
+    def test_live_audio_wav_conversion_and_buffer_limit(self):
+        wav_bytes = pcm16_mono_to_wav(b"\x00\x00" * 4, sample_rate=8000)
+        metadata = extract_audio_metadata(wav_bytes, "live_chunk.wav")
+        self.assertTrue(metadata["is_valid_audio"])
+        self.assertEqual(metadata["sample_rate_hz"], 8000)
+
+        buffer = LiveAudioBuffer(
+            chunk_seconds=1,
+            max_buffer_seconds=1,
+            sample_rate=2,
+            resampler=object(),
+        )
+        buffer.append_pcm_bytes(b"\x00\x00" * 3)
+        self.assertIn("buffer is full", buffer.error)
+        with self.assertRaises(ValueError):
+            pcm16_mono_to_wav(b"\x00")
 
     def test_02_wav_metadata_extraction(self):
         """Verifies extraction of duration, sample rate, bit depth, and channels."""
