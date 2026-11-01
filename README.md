@@ -138,6 +138,12 @@ $env:SCAMSHIELD_ALERT_TOKEN = "<the same private alert token>"
 
 For a local development setup, deploy the alert server to a temporary public HTTPS/WSS endpoint and use that endpoint in both configurations. Secure it; the endpoint receives private call audio.
 
+#### Deploy the call-monitoring server on Render
+
+The included `render.yaml` is a Render Blueprint for the call-monitoring API. In Render, choose **New → Blueprint**, connect this repository, and select `main`. During setup, enter the Twilio Auth Token and forwarding phone number if prompted. After Render creates the service, copy its public `https://...onrender.com` URL into `SCAMSHIELD_PUBLIC_BASE_URL` in the service's Environment settings and redeploy. Keep the generated `SCAMSHIELD_ALERT_TOKEN` private; use the same value in the dashboard's environment as `SCAMSHIELD_ALERT_TOKEN`.
+
+The Blueprint uses Render's free instance for initial testing. Free instances can sleep when idle, so call webhooks may be delayed while the service wakes. Use an always-on plan for reliable call monitoring. The service needs internet access to download the Whisper model, and transcribed calls are processed on the configured host.
+
 ### 6. Run the Automated Test Suites
 Run all **104 automated tests** (101 unit/integration tests + 3 real-speech smoke tests) across the complete defensive pipeline:
 ```powershell

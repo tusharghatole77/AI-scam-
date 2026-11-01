@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: scamshield-call-monitor
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python twilio_live_server.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: SCAMSHIELD_PUBLIC_BASE_URL
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: SCAMSHIELD_ALERT_TOKEN
+        generateValue: true
+      - key: SCAMSHIELD_FORWARD_TO
+        sync: false
+      - key: SCAMSHIELD_ENABLE_CALL_MONITOR
+        value: "true"
+      - key: SCAMSHIELD_WHISPER_LANGUAGE
+        value: auto
+      - key: SCAMSHIELD_WHISPER_MODEL
+        value: base
